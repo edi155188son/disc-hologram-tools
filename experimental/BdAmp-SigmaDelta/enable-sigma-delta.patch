@@ -1,0 +1,78 @@
+--- tools/BdAmp/Program.cs
++++ tools/BdAmp/Program.cs
+@@ -206,7 +206,7 @@
+         if (!o.ContainsKey("--output") || !o.ContainsKey("--fields") || !o.ContainsKey("--inner") || !o.ContainsKey("--outer"))
+         {
+             Console.WriteLine("BdAmp --inner R --outer R [--sectors 12219392] [--pitch-linear a --pitch-quadratic b --pitch-cubic c]\n"
+-                + "      [--start-angle deg] [--max-radius mm] [--dark 9E] [--light 22] [--encoding lee|dp] [--combine first|sum] [--taper mm] [--steer-parity on] [--steer-verify N] [--opt-bits file.bdopt [--load-fields]] --fields a.bdaf[,b.bdaf...] --output out.iso");
++                + "      [--start-angle deg] [--max-radius mm] [--dark 9E] [--light 22] [--encoding lee|dp|sd] [--sd-r 0.85] [--sd-level 1.5 | --sd-gain g] [--combine first|sum] [--taper mm] [--steer-parity on] [--steer-verify N] [--opt-bits file.bdopt [--load-fields]] --fields a.bdaf[,b.bdaf...] --output out.iso");
+             return 2;
+         }
+         double D(string k, double d) => o.TryGetValue(k, out var v) ? double.Parse(v, CultureInfo.InvariantCulture) : d;
+@@ -236,8 +236,8 @@
+             return 0;
+         }
+         string enc = o.GetValueOrDefault("--encoding", "lee");
+-        DoublePhase = enc == "dp";
+-        if (DoublePhase)
++        DoublePhase = enc == "dp"; bool sdMode = enc == "sd";
++        if (DoublePhase || sdMode)
+         {
+             double offset = (disc.StartAngleDegrees % 360) * Math.PI / 180, inner = disc.InnerRadiusMm;
+             Func<double, double> theta;
+@@ -248,6 +248,16 @@
+                 theta = r => dg.AngleAtRadius(r);
+             }
+             else { double g = geo.EffectiveTrackPitchMicrometers / (2 * Math.PI * 1000); theta = r => (r - inner) / g; }
++            Func<double, double> thetaInv;
++            if (disc.HasVariablePitch)
++                thetaInv = t =>
++                {
++                    double g0 = geo.EffectiveTrackPitchMicrometers / (2 * Math.PI * 1000), r = inner + g0 * t;
++                    for (int it = 0; it < 6; it++) { double f0 = theta(r) - t, d = (theta(r + 1e-4) - theta(r - 1e-4)) / 2e-4; r -= f0 / d; }
++                    return r;
++                };
++            else { double g = geo.EffectiveTrackPitchMicrometers / (2 * Math.PI * 1000); thetaInv = t => inner + g * t; }
++            BdAmpSd.Theta = theta; BdAmpSd.ThetaInv = thetaInv; BdAmpSd.Offset = offset;
+             Parity = (x, y) =>
+             {
+                 double r = Math.Sqrt(x * x + y * y);
+@@ -263,7 +273,8 @@
+                 var p1 = geo.AtSector(sec + turn);
+                 if (Parity(p0.Xmm, p0.Ymm) == Parity(p1.Xmm, p1.Ymm)) bad++;
+             }
+-            Console.WriteLine($"Encoding: double-phase (track parity self-check: {bad}/2000 non-alternating)");
++            Console.WriteLine(sdMode ? $"Encoding: band-pass sigma-delta along tracks (track index self-check: {bad}/2000 non-alternating)"
++                                     : $"Encoding: double-phase (track parity self-check: {bad}/2000 non-alternating)");
+         }
+         else Console.WriteLine("Encoding: Lee (detour-phase, width = amplitude)");
+         bool fastOpt = o.ContainsKey("--opt-bits") && !o.ContainsKey("--load-fields");
+@@ -288,6 +299,14 @@
+         Taper = D("--taper", 0);
+         if (Taper > 0) Console.WriteLine($"Apodization: cos^2 edge taper {Taper} mm");
+         // desired on-disc pattern: 0 / 255, or -1 = free (outside every block -> noise, usable for parity steering)
++        SdGroup[] sdGroups = [];
++        if (sdMode)
++        {
++            BdAmpSd.R = D("--sd-r", 0.85); BdAmpSd.Gain = D("--sd-gain", 0); BdAmpSd.Level = D("--sd-level", 1.5); BdAmpSd.ColPitchMm = D("--sd-col", 0.465) * 1e-3;
++            Console.WriteLine("Sigma-delta precompute:");
++            sdGroups = BdAmpSd.Build(fields);
++            if (o.TryGetValue("--sd-dump", out var dumpPath)) { BdAmpSd.Dump(sdGroups[0], dumpPath, D("--sd-dump-half", 0.3)); return 0; }
++        }
+         Func<double, double, int> desired = (x, y) =>
+         {
+             if (fastOpt)
+@@ -296,6 +315,13 @@
+                     if (f.Lambda <= 0 && Sample(f, x, y, out bool lb)) return lb ? 255 : 0;
+                 return inCarrierBlock(x, y) ? 0 : -1;
+             }
++            if (sdMode)
++            {
++                foreach (var f in fields)
++                    if (f.Lambda <= 0 && Sample(f, x, y, out bool lb)) return lb ? 255 : 0;
++                foreach (var gr in sdGroups) { int b = BdAmpSd.Lookup(gr, x, y); if (b >= 0) return b == 1 ? 255 : 0; }
++                return -1;
++            }
+             if (sumMode)
+             {
+                 foreach (var f in fields)
