@@ -1,0 +1,7 @@
+numpy>=1.26
+torch>=2.2        # CUDA build recommended for bdopt.py / fields_gpu.py; CPU works for small tiles
+Pillow>=10
+# extras for python/avatar3d only:
+# scipy>=1.11
+# scikit-image>=0.22
+# (render_views.py runs inside Blender: blender -b --python render_views.py -- 7 12)
