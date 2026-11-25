@@ -1,0 +1,30 @@
+<Project>
+  <!--
+    All C# tools in this repository build against a Disc Image Studio (DIS) source tree that has the
+    patches from dis-patches/ applied.  Point DisRoot at it, either
+      * with the DIS_ROOT environment variable:   DIS_ROOT=/path/to/DiscImageStudio dotnet build ...
+      * or with a property on the command line:   dotnet build -p:DisRoot=/path/to/DiscImageStudio
+      * or by adding the upstream repo as a git submodule at external/DiscImageStudio.
+    See docs/building.md and scripts/prepare-dis.sh.
+  -->
+  <PropertyGroup>
+    <DisRoot Condition="'$(DisRoot)' == '' and '$(DIS_ROOT)' != ''">$(DIS_ROOT)</DisRoot>
+    <DisRoot Condition="'$(DisRoot)' == ''">$(MSBuildThisFileDirectory)external/DiscImageStudio</DisRoot>
+    <DisRoot>$([MSBuild]::EnsureTrailingSlash('$(DisRoot)'))</DisRoot>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>annotations</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <LangVersion>latest</LangVersion>
+    <Deterministic>true</Deterministic>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <Authors>Hologram tools contributors</Authors>
+    <PackageLicenseExpression>GPL-3.0-or-later</PackageLicenseExpression>
+    <!-- keep build output of the tools out of the source tree -->
+    <BaseOutputPath>$(MSBuildThisFileDirectory)artifacts/bin/$(MSBuildProjectName)/</BaseOutputPath>
+    <BaseIntermediateOutputPath>$(MSBuildThisFileDirectory)artifacts/obj/$(MSBuildProjectName)/</BaseIntermediateOutputPath>
+  </PropertyGroup>
+  <Target Name="CheckDisRoot" BeforeTargets="PrepareForBuild;ResolveProjectReferences" Condition="!Exists('$(DisRoot)DiscImageStudio.slnx')">
+    <Error Text="DisRoot '$(DisRoot)' is not a Disc Image Studio checkout. Set DIS_ROOT (see docs/building.md)." />
+  </Target>
+</Project>

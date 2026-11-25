@@ -1,0 +1,1210 @@
+From 68b586653e32fa26aba1222fc2fbeef9991169e8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 16 Nov 2026 22:58:30 +0800
+Subject: [PATCH] Add DVD multi-view stereo layers
+
+A design layer can be marked as a stereo layer: each view is written with
+its own scrambled-byte sequence whose EFMPlus marks form a nearly pure
+along-track grating (5F C5DB F9 CC67 6F DDB6 A5, 2.13-0.85 um), so each
+view leaves at its own diffraction angle and moving the head along the
+track switches views, lenticular-card style.
+
+- StereoOverlay (DvdImageSolver): per-codeword override loaded from a
+  <picture>.stereo.json sidecar, so ISO export, stream burn and the CLI
+  all apply it; explicit 2-7 view images or one image plus a depth map;
+  interleave cell length, copies round the disc, reverse order.
+- Blocks touching a stereo layer use the scalar sampler; all others keep
+  SIMD and sample reuse. Output is byte-identical to a direct
+  per-codeword reference.
+- Project schema: optional ProjectLayer.Stereo, validated.
+- Design page: stereo controls in the layer properties, faded copies on
+  the canvas, copies in composites, 'point outward' helper.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GxNFJdceW8VtXpKpEJ6Ejb
+---
+ .../Controls/DiscDesignCanvas.cs              |  33 ++
+ .../Localization/Catalogs/Common.json         |  30 ++
+ .../Localization/Catalogs/Xaml.json           | 126 ++++++
+ .../ViewModels/DesignLayerViewModel.cs        |  92 ++++
+ .../ViewModels/DesignViewModel.cs             | 139 +++++-
+ src/DiscImageStudio.App/Views/DesignView.xaml |  72 ++++
+ src/DiscImageStudio.Core/ProjectJsonStore.cs  |  38 +-
+ .../Solver/FastDispersionImageWriter.cs       |  31 +-
+ src/DvdImageSolver/Solver/StereoOverlay.cs    | 403 ++++++++++++++++++
+ 9 files changed, 948 insertions(+), 16 deletions(-)
+ create mode 100644 src/DvdImageSolver/Solver/StereoOverlay.cs
+
+diff --git a/src/DiscImageStudio.App/Controls/DiscDesignCanvas.cs b/src/DiscImageStudio.App/Controls/DiscDesignCanvas.cs
+index 24d358b..84e20a2 100644
+--- a/src/DiscImageStudio.App/Controls/DiscDesignCanvas.cs
++++ b/src/DiscImageStudio.App/Controls/DiscDesignCanvas.cs
+@@ -362,6 +362,7 @@ public class DiscDesignCanvas : FrameworkElement
+             context.PushTransform(transform);
+             context.DrawImage(layer.Image, new Rect(0, 0, widthPx, heightPx));
+             context.Pop();
++            DrawStereoCopies(context, layer, widthPx, heightPx);
+         }
+         else
+         {
+@@ -375,6 +376,38 @@ public class DiscDesignCanvas : FrameworkElement
+         }
+     }
+ 
++    /// <summary>DVD stereo layers repeated round the disc: the extra copies are drawn faded so
++    /// the editable original stays obvious. Each copy is the whole layer rotated about the disc
++    /// centre, exactly as the stereo overlay writes it.</summary>
++    private void DrawStereoCopies(DrawingContext context, DesignLayerViewModel layer, double widthPx, double heightPx)
++    {
++        if (_design is null || !_design.IsDvd || !layer.IsStereo || layer.StereoCopies <= 1)
++        {
++            return;
++        }
++
++        Point discCenter = ScreenFromMm(0, 0);
++        Point topLeft = ScreenFromMm(
++            layer.TranslateXMm - SizeWidthMm(layer) / 2,
++            layer.TranslateYMm - SizeHeightMm(layer) / 2);
++        context.PushOpacity(0.45);
++        for (int copy = 1; copy < layer.StereoCopies; copy++)
++        {
++            double angle = 360.0 * copy / layer.StereoCopies;
++            TransformGroup transform = new();
++            transform.Children.Add(new TranslateTransform(topLeft.X, topLeft.Y));
++            transform.Children.Add(new RotateTransform(
++                layer.RotationDeg,
++                topLeft.X + widthPx / 2,
++                topLeft.Y + heightPx / 2));
++            transform.Children.Add(new RotateTransform(angle, discCenter.X, discCenter.Y));
++            context.PushTransform(transform);
++            context.DrawImage(layer.Image, new Rect(0, 0, widthPx, heightPx));
++            context.Pop();
++        }
++        context.Pop();
++    }
++
+     /// <summary>The data-occupied zone as a theme-blue ring (DiscDataRegionBrush), painted
+     /// after every layer and adorner so the guide can never disappear under artwork.
+     /// Translucent fill, no border. Every occupied annulus from the real layout plan is
+diff --git a/src/DiscImageStudio.App/Localization/Catalogs/Common.json b/src/DiscImageStudio.App/Localization/Catalogs/Common.json
+index b03ef69..102045a 100644
+--- a/src/DiscImageStudio.App/Localization/Catalogs/Common.json
++++ b/src/DiscImageStudio.App/Localization/Catalogs/Common.json
+@@ -1429,5 +1429,35 @@
+     "tr": "Geleneksel Çince",
+     "es": "繁體中文",
+     "cs": "繁體中文"
++  },
++  "立体图层": {
++    "zh-CN": "立体图层",
++    "en": "Stereo layer",
++    "zh-TW": "立體圖層",
++    "ja": "ステレオレイヤー"
++  },
++  "请选择 {0} 到 {1} 张视角图。": {
++    "zh-CN": "请选择 {0} 到 {1} 张视角图。",
++    "en": "Select {0} to {1} view images.",
++    "zh-TW": "請選擇 {0} 到 {1} 張視角圖。",
++    "ja": "視点画像を {0}〜{1} 枚選択してください。"
++  },
++  "视角图不支持 SVG，请使用 PNG 或 JPG。": {
++    "zh-CN": "视角图不支持 SVG，请使用 PNG 或 JPG。",
++    "en": "View images cannot be SVG; use PNG or JPG.",
++    "zh-TW": "視角圖不支援 SVG，請使用 PNG 或 JPG。",
++    "ja": "視点画像に SVG は使えません。PNG か JPG を使ってください。"
++  },
++  "深度图不支持 SVG，请使用 PNG 或 JPG。": {
++    "zh-CN": "深度图不支持 SVG，请使用 PNG 或 JPG。",
++    "en": "A depth map cannot be SVG; use PNG or JPG.",
++    "zh-TW": "深度圖不支援 SVG，請使用 PNG 或 JPG。",
++    "ja": "深度マップに SVG は使えません。PNG か JPG を使ってください。"
++  },
++  "立体图层“{0}”使用 SVG 图片；请改用 PNG/JPG 或选择视角图。": {
++    "zh-CN": "立体图层“{0}”使用 SVG 图片；请改用 PNG/JPG 或选择视角图。",
++    "en": "Stereo layer “{0}” uses an SVG picture; use PNG/JPG or choose view images.",
++    "zh-TW": "立體圖層「{0}」使用 SVG 圖片；請改用 PNG/JPG 或選擇視角圖。",
++    "ja": "ステレオレイヤー「{0}」は SVG 画像です。PNG/JPG にするか視点画像を選択してください。"
+   }
+ }
+diff --git a/src/DiscImageStudio.App/Localization/Catalogs/Xaml.json b/src/DiscImageStudio.App/Localization/Catalogs/Xaml.json
+index 6e5ef98..4389101 100644
+--- a/src/DiscImageStudio.App/Localization/Catalogs/Xaml.json
++++ b/src/DiscImageStudio.App/Localization/Catalogs/Xaml.json
+@@ -2059,5 +2059,131 @@
+     "tr": "Kalibrasyon",
+     "es": "Calibración",
+     "cs": "Kalibrace"
++  },
++  "Xaml.StereoLayer": {
++    "zh-CN": "立体图层（多视角，DVD）",
++    "en": "Stereo layer (multi-view, DVD)",
++    "zh-TW": "立體圖層（多視角，DVD）",
++    "ja": "ステレオレイヤー（多視点、DVD）"
++  },
++  "Xaml.StereoLayerHint": {
++    "zh-CN": "每个视角用一种沿轨道光栅字节写入，各自射向不同的衍射角；左右移动头部会切换视角（类似光栅卡）。只用于 DVD。",
++    "en": "Each view is written with its own along-track grating byte, which sends it to its own diffraction angle; moving your head switches views like a lenticular card. DVD only.",
++    "zh-TW": "每個視角用一種沿軌道光柵位元組寫入，各自射向不同的繞射角；左右移動頭部會切換視角（類似光柵卡）。只用於 DVD。",
++    "ja": "各視点はトラック方向の回折格子となるバイトで書き込まれ、それぞれ異なる回折角に向かいます。頭を左右に動かすと視点が切り替わります（レンチキュラーカード風）。DVD のみ。"
++  },
++  "Xaml.StereoViewSource": {
++    "zh-CN": "视角来源",
++    "en": "View source",
++    "zh-TW": "視角來源",
++    "ja": "視点のソース"
++  },
++  "Xaml.StereoChooseViews": {
++    "zh-CN": "选择视角图…",
++    "en": "Choose views…",
++    "zh-TW": "選擇視角圖…",
++    "ja": "視点画像を選択…"
++  },
++  "Xaml.StereoChooseViewsHint": {
++    "zh-CN": "一次选择 2–7 张图，按文件名排序（view1、view2 …）。",
++    "en": "Select 2–7 images at once; they are ordered by file name (view1, view2 …).",
++    "zh-TW": "一次選擇 2–7 張圖，依檔名排序（view1、view2 …）。",
++    "ja": "2〜7 枚をまとめて選択します。ファイル名順に並びます（view1、view2 …）。"
++  },
++  "Xaml.StereoClearViews": {
++    "zh-CN": "改用本图层图片",
++    "en": "Use layer image",
++    "zh-TW": "改用本圖層圖片",
++    "ja": "レイヤー画像を使用"
++  },
++  "Xaml.StereoChooseDepth": {
++    "zh-CN": "深度图…",
++    "en": "Depth map…",
++    "zh-TW": "深度圖…",
++    "ja": "深度マップ…"
++  },
++  "Xaml.StereoChooseDepthHint": {
++    "zh-CN": "灰度图，白色＝近、黑色＝远；用本图层图片合成各视角。",
++    "en": "Grayscale, white = near, black = far; views are synthesised from the layer image.",
++    "zh-TW": "灰階圖，白色＝近、黑色＝遠；用本圖層圖片合成各視角。",
++    "ja": "グレースケール（白＝手前、黒＝奥）。レイヤー画像から各視点を合成します。"
++  },
++  "Xaml.StereoClearDepth": {
++    "zh-CN": "移除深度图",
++    "en": "Remove depth map",
++    "zh-TW": "移除深度圖",
++    "ja": "深度マップを外す"
++  },
++  "Xaml.StereoViews": {
++    "zh-CN": "视角数 (2–7)",
++    "en": "Views (2–7)",
++    "zh-TW": "視角數 (2–7)",
++    "ja": "視点数 (2–7)"
++  },
++  "Xaml.StereoParallax": {
++    "zh-CN": "视差 (mm)",
++    "en": "Parallax (mm)",
++    "zh-TW": "視差 (mm)",
++    "ja": "視差 (mm)"
++  },
++  "Xaml.StereoParallaxHint": {
++    "zh-CN": "最近的点在两端视角之间移动的距离（最远的点反方向移动同样距离）。",
++    "en": "How far the nearest point moves between the two outermost views; the farthest point moves the same distance the other way.",
++    "zh-TW": "最近的點在兩端視角之間移動的距離（最遠的點反方向移動同樣距離）。",
++    "ja": "最も手前の点が両端の視点間で動く距離（最も奥の点は逆方向に同じだけ動きます）。"
++  },
++  "Xaml.StereoCell": {
++    "zh-CN": "交错单元 (mm)",
++    "en": "Cell (mm)",
++    "zh-TW": "交錯單元 (mm)",
++    "ja": "セル (mm)"
++  },
++  "Xaml.StereoCellHint": {
++    "zh-CN": "沿图层横向排列一次所有视角的长度；越小越细，0.2 mm 已验证可用。",
++    "en": "Length along the layer that holds one slice of every view; smaller is finer. 0.2 mm has been verified.",
++    "zh-TW": "沿圖層橫向排列一次所有視角的長度；越小越細，0.2 mm 已驗證可用。",
++    "ja": "全視点を 1 回ずつ並べる長さ（レイヤー横方向）。小さいほど細かく、0.2 mm で動作確認済み。"
++  },
++  "Xaml.StereoCopies": {
++    "zh-CN": "绕圈份数",
++    "en": "Copies round disc",
++    "zh-TW": "繞圈份數",
++    "ja": "周回コピー数"
++  },
++  "Xaml.StereoCopiesHint": {
++    "zh-CN": "把图层绕盘心重复几份；8 份时转到任何角度都看得到一份。",
++    "en": "Repeats the layer round the disc centre; with 8 copies one is visible at any disc orientation.",
++    "zh-TW": "把圖層繞盤心重複幾份；8 份時轉到任何角度都看得到一份。",
++    "ja": "レイヤーをディスク中心の周りに複製します。8 個ならどの向きでもどれかが見えます。"
++  },
++  "Xaml.StereoReverse": {
++    "zh-CN": "反转视角顺序（立体凹凸相反时勾选）",
++    "en": "Reverse view order (if depth looks inside out)",
++    "zh-TW": "反轉視角順序（立體凹凸相反時勾選）",
++    "ja": "視点の順序を反転（凹凸が逆に見える場合）"
++  },
++  "Xaml.StereoReverseHint": {
++    "zh-CN": "左右眼看到的视角对调。",
++    "en": "Swaps which views the left and right eye see.",
++    "zh-TW": "左右眼看到的視角對調。",
++    "ja": "左右の目に見える視点を入れ替えます。"
++  },
++  "Xaml.StereoOrientOutward": {
++    "zh-CN": "朝外对齐",
++    "en": "Point outward",
++    "zh-TW": "朝外對齊",
++    "ja": "外向きに揃える"
++  },
++  "Xaml.StereoOrientOutwardHint": {
++    "zh-CN": "旋转图层，让图片上方朝向盘外；视角沿轨道变化，这个方向看起来才是正的。",
++    "en": "Rotates the layer so the top of the picture points away from the centre; views change along the track, so this is the upright orientation.",
++    "zh-TW": "旋轉圖層，讓圖片上方朝向盤外；視角沿軌道變化，這個方向看起來才是正的。",
++    "ja": "画像の上端がディスクの外側を向くよう回転します。視点はトラック方向に変わるため、この向きが正立になります。"
++  },
++  "Xaml.StereoViewingHint": {
++    "zh-CN": "观看：点光源（手机手电筒）放在眼睛侧边约 30°、同高，图层转到 12 点钟方向，左右移动头部。",
++    "en": "Viewing: point light (phone torch) about 30° to the side of your eyes at the same height, layer at 12 o'clock, move your head sideways.",
++    "zh-TW": "觀看：點光源（手機手電筒）放在眼睛側邊約 30°、同高，圖層轉到 12 點鐘方向，左右移動頭部。",
++    "ja": "観察：点光源（スマホのライト）を目の横約 30°・同じ高さに置き、レイヤーを 12 時の位置にして頭を左右に動かします。"
+   }
+ }
+diff --git a/src/DiscImageStudio.App/ViewModels/DesignLayerViewModel.cs b/src/DiscImageStudio.App/ViewModels/DesignLayerViewModel.cs
+index 637e90c..2ec92cf 100644
+--- a/src/DiscImageStudio.App/ViewModels/DesignLayerViewModel.cs
++++ b/src/DiscImageStudio.App/ViewModels/DesignLayerViewModel.cs
+@@ -1,6 +1,7 @@
+ using System.Windows.Media;
+ using System.Windows.Media.Imaging;
+ using CommunityToolkit.Mvvm.ComponentModel;
++using DiscImageStudio.Core;
+ using DiscImageStudio.Services;
+ 
+ namespace DiscImageStudio.ViewModels;
+@@ -21,6 +22,95 @@ public partial class DesignLayerViewModel : ObservableObject
+     [ObservableProperty] private double _rotationDeg;
+     [ObservableProperty] private double _scale = 1.0;
+ 
++    // ---- DVD multi-view stereo (lenticular-style) ----
++    // Each view is written with its own byte sequence whose along-track EFM grating sends it to
++    // its own diffraction angle; see DvdImageSolver.Solver.StereoOverlay.
++
++    [ObservableProperty]
++    [NotifyPropertyChangedFor(nameof(StereoSummary))]
++    private bool _isStereo;
++
++    /// <summary>Ordered view images; empty means the layer image is used for every view.</summary>
++    [ObservableProperty]
++    [NotifyPropertyChangedFor(nameof(StereoSummary), nameof(HasStereoViewFiles), nameof(StereoViewsEditable))]
++    private IReadOnlyList<string> _stereoViewPaths = [];
++
++    [ObservableProperty]
++    [NotifyPropertyChangedFor(nameof(StereoSummary), nameof(HasStereoDepthMap))]
++    private string? _stereoDepthMapPath;
++
++    [ObservableProperty]
++    [NotifyPropertyChangedFor(nameof(StereoSummary))]
++    private int _stereoViews = 4;
++
++    [ObservableProperty] private double _stereoParallaxMm = 1.0;
++    [ObservableProperty] private double _stereoHogelMm = 0.2;
++    [ObservableProperty] private int _stereoCopies = 1;
++    [ObservableProperty] private bool _stereoReverseViews;
++
++    public bool HasStereoViewFiles => StereoViewPaths.Count > 0;
++
++    public bool HasStereoDepthMap => !string.IsNullOrWhiteSpace(StereoDepthMapPath);
++
++    /// <summary>The view count is fixed by the files when explicit views are chosen.</summary>
++    public bool StereoViewsEditable => StereoViewPaths.Count == 0;
++
++    /// <summary>Views actually written: the chosen files, or the configured count.</summary>
++    public int EffectiveStereoViews => StereoViewPaths.Count > 0 ? StereoViewPaths.Count : StereoViews;
++
++    /// <summary>One-line description of the view source for the property panel.</summary>
++    public string StereoSummary => StereoViewPaths.Count > 0
++        ? string.Join(" · ", StereoViewPaths.Select(System.IO.Path.GetFileName))
++        : HasStereoDepthMap
++            ? $"{StereoViews} × {System.IO.Path.GetFileName(ImagePath)} + {System.IO.Path.GetFileName(StereoDepthMapPath)}"
++            : $"{StereoViews} × {System.IO.Path.GetFileName(ImagePath)}";
++
++    partial void OnStereoViewsChanged(int value)
++    {
++        int clamped = Math.Clamp(value, ProjectStereoSettings.MinViews, ProjectStereoSettings.MaxViews);
++        if (clamped != value) StereoViews = clamped;
++    }
++
++    partial void OnStereoHogelMmChanged(double value)
++    {
++        if (!double.IsFinite(value)) { StereoHogelMm = 0.2; return; }
++        double clamped = Math.Clamp(value, ProjectStereoSettings.MinHogelMm, ProjectStereoSettings.MaxHogelMm);
++        if (clamped != value) StereoHogelMm = clamped;
++    }
++
++    partial void OnStereoCopiesChanged(int value)
++    {
++        int clamped = Math.Clamp(value, 1, ProjectStereoSettings.MaxCopies);
++        if (clamped != value) StereoCopies = clamped;
++    }
++
++    partial void OnStereoParallaxMmChanged(double value)
++    {
++        if (!double.IsFinite(value)) { StereoParallaxMm = 0; return; }
++        double clamped = Math.Clamp(value, 0, ProjectStereoSettings.MaxParallaxMm);
++        if (clamped != value) StereoParallaxMm = clamped;
++    }
++
++    /// <summary>Settings to save; null for a layer that never used stereo.</summary>
++    public ProjectStereoSettings? CaptureStereo()
++        => !IsStereo && StereoViewPaths.Count == 0 && StereoDepthMapPath is null
++            ? null
++            : new ProjectStereoSettings(IsStereo, StereoViewPaths.Count > 0 ? StereoViewPaths.ToList() : null,
++                StereoDepthMapPath, StereoViews, StereoParallaxMm, StereoHogelMm, StereoCopies, StereoReverseViews);
++
++    public void ApplyStereo(ProjectStereoSettings? stereo)
++    {
++        if (stereo is null) return;
++        StereoViewPaths = stereo.ViewPaths?.ToList() ?? [];
++        StereoDepthMapPath = stereo.DepthMapPath;
++        StereoViews = stereo.Views;
++        StereoParallaxMm = stereo.ParallaxMm;
++        StereoHogelMm = stereo.HogelMm;
++        StereoCopies = stereo.Copies;
++        StereoReverseViews = stereo.ReverseViews;
++        IsStereo = stereo.Enabled;
++    }
++
+     public ImageSource? Image { get; private set; }
+ 
+     /// <summary>Small decode or vector drawing for the layer panel's list row.</summary>
+@@ -43,6 +133,8 @@ public partial class DesignLayerViewModel : ObservableObject
+ 
+     partial void OnScaleChanged(double value) => OnPropertyChanged(nameof(ScalePercent));
+ 
++    partial void OnImagePathChanged(string value) => OnPropertyChanged(nameof(StereoSummary));
++
+     /// <summary>Applies the image and derives the base size. Returns false when the file cannot
+     /// be read; the layer then renders as a placeholder box. <paramref name="preloaded"/> carries
+     /// a decode that already happened on a background thread, so opening a project does not pay
+diff --git a/src/DiscImageStudio.App/ViewModels/DesignViewModel.cs b/src/DiscImageStudio.App/ViewModels/DesignViewModel.cs
+index afa717b..dfebecd 100644
+--- a/src/DiscImageStudio.App/ViewModels/DesignViewModel.cs
++++ b/src/DiscImageStudio.App/ViewModels/DesignViewModel.cs
+@@ -78,6 +78,11 @@ public partial class DesignViewModel : ObservableObject
+                 layer.IsVisible = !layer.IsVisible;
+             }
+         });
++        ChooseStereoViewsCommand = new RelayCommand(ChooseStereoViews, () => SelectedLayer is not null && !_shell.IsBusy);
++        ClearStereoViewsCommand = new RelayCommand(() => { if (SelectedLayer is { } l) l.StereoViewPaths = []; });
++        ChooseStereoDepthCommand = new RelayCommand(ChooseStereoDepth, () => SelectedLayer is not null && !_shell.IsBusy);
++        ClearStereoDepthCommand = new RelayCommand(() => { if (SelectedLayer is { } l) l.StereoDepthMapPath = null; });
++        OrientOutwardCommand = new RelayCommand(OrientSelectedOutward, () => SelectedLayer is not null && !_shell.IsBusy);
+         Layers.CollectionChanged += Layers_CollectionChanged;
+         Tone = new ToneViewModel(shell, state, this);
+         RefreshDataRegionText();
+@@ -213,7 +218,15 @@ public partial class DesignViewModel : ObservableObject
+                 or nameof(DesignLayerViewModel.Scale)
+                 or nameof(DesignLayerViewModel.IsVisible)
+                 or nameof(DesignLayerViewModel.Name)
+-                or nameof(DesignLayerViewModel.ImagePath))
++                or nameof(DesignLayerViewModel.ImagePath)
++                or nameof(DesignLayerViewModel.IsStereo)
++                or nameof(DesignLayerViewModel.StereoViewPaths)
++                or nameof(DesignLayerViewModel.StereoDepthMapPath)
++                or nameof(DesignLayerViewModel.StereoViews)
++                or nameof(DesignLayerViewModel.StereoParallaxMm)
++                or nameof(DesignLayerViewModel.StereoHogelMm)
++                or nameof(DesignLayerViewModel.StereoCopies)
++                or nameof(DesignLayerViewModel.StereoReverseViews))
+             {
+                 if (!_suppressLayerEvents)
+                 {
+@@ -228,6 +241,98 @@ public partial class DesignViewModel : ObservableObject
+     private void NotifySelectionCommands()
+     {
+         RemoveSelectedCommand.NotifyCanExecuteChanged();
++        ChooseStereoViewsCommand.NotifyCanExecuteChanged();
++        ChooseStereoDepthCommand.NotifyCanExecuteChanged();
++        OrientOutwardCommand.NotifyCanExecuteChanged();
++    }
++
++    // ---- DVD multi-view stereo layers ----
++
++    public RelayCommand ChooseStereoViewsCommand { get; }
++
++    public RelayCommand ClearStereoViewsCommand { get; }
++
++    public RelayCommand ChooseStereoDepthCommand { get; }
++
++    public RelayCommand ClearStereoDepthCommand { get; }
++
++    public RelayCommand OrientOutwardCommand { get; }
++
++    /// <summary>Picks the ordered view images (sorted by file name, so view_1 … view_N work).</summary>
++    private void ChooseStereoViews()
++    {
++        if (SelectedLayer is not DesignLayerViewModel layer) return;
++        string[]? picked = _shell.Dialogs?.PickImages();
++        if (picked is null || picked.Length == 0) return;
++        string[] ordered = picked.OrderBy(path => Path.GetFileName(path), StringComparer.OrdinalIgnoreCase).ToArray();
++        if (ordered.Length is < ProjectStereoSettings.MinViews or > ProjectStereoSettings.MaxViews)
++        {
++            _shell.ShowToast(L.T("立体图层"),
++                L.Format("请选择 {0} 到 {1} 张视角图。", ProjectStereoSettings.MinViews, ProjectStereoSettings.MaxViews),
++                ToastKind.Warning);
++            return;
++        }
++        if (ordered.Any(DesignComposer.IsSvgPath))
++        {
++            _shell.ShowToast(L.T("立体图层"), L.T("视角图不支持 SVG，请使用 PNG 或 JPG。"), ToastKind.Warning);
++            return;
++        }
++        layer.StereoViewPaths = ordered;
++        layer.IsStereo = true;
++    }
++
++    private void ChooseStereoDepth()
++    {
++        if (SelectedLayer is not DesignLayerViewModel layer) return;
++        string? picked = _shell.Dialogs?.PickImage();
++        if (string.IsNullOrWhiteSpace(picked)) return;
++        if (DesignComposer.IsSvgPath(picked))
++        {
++            _shell.ShowToast(L.T("立体图层"), L.T("深度图不支持 SVG，请使用 PNG 或 JPG。"), ToastKind.Warning);
++            return;
++        }
++        layer.StereoDepthMapPath = picked;
++        layer.IsStereo = true;
++    }
++
++    /// <summary>Rotates the selected layer so its top points away from the disc centre. Stereo
++    /// views change along the track, so a stereo layer reads upright only in this orientation.</summary>
++    private void OrientSelectedOutward()
++    {
++        if (SelectedLayer is not DesignLayerViewModel layer) return;
++        double x = layer.TranslateXMm, y = layer.TranslateYMm;
++        if (Math.Abs(x) < 1e-6 && Math.Abs(y) < 1e-6) return;
++        layer.RotationDeg = Math.Round(Math.Atan2(x, -y) * 180 / Math.PI, 2);
++    }
++
++    /// <summary>Visible stereo layers as overlay specs (DVD only; other families draw them as
++    /// ordinary pictures).</summary>
++    private List<DvdImageSolver.Solver.StereoLayerSpec> BuildStereoSpecs()
++    {
++        List<DvdImageSolver.Solver.StereoLayerSpec> specs = [];
++        if (Family != OpticalDiscFamily.Dvd) return specs;
++        foreach (DesignLayerViewModel layer in Layers)
++        {
++            if (!layer.IsVisible || !layer.HasImage || !layer.IsStereo) continue;
++            bool explicitViews = layer.StereoViewPaths.Count > 0;
++            if (!explicitViews && DesignComposer.IsSvgPath(layer.ImagePath))
++                throw new ArgumentException(L.Format("立体图层“{0}”使用 SVG 图片；请改用 PNG/JPG 或选择视角图。", layer.Name));
++            specs.Add(new DvdImageSolver.Solver.StereoLayerSpec(
++                explicitViews ? layer.StereoViewPaths.ToList() : null,
++                explicitViews ? null : layer.ImagePath,
++                explicitViews ? null : layer.StereoDepthMapPath,
++                layer.EffectiveStereoViews,
++                layer.StereoParallaxMm,
++                layer.TranslateXMm,
++                layer.TranslateYMm,
++                layer.BaseWidthMm * layer.Scale,
++                layer.BaseHeightMm * layer.Scale,
++                layer.RotationDeg,
++                layer.StereoHogelMm,
++                layer.StereoCopies,
++                layer.StereoReverseViews));
++        }
++        return specs;
+     }
+ 
+     partial void OnSelectedLayerChanged(DesignLayerViewModel? value)
+@@ -766,6 +871,7 @@ public partial class DesignViewModel : ObservableObject
+                     RotationDeg = layer.RotationDeg,
+                     Scale = layer.Scale,
+                 };
++                viewModel.ApplyStereo(layer.Stereo);
+                 (ImageSource? Image, ImageSource? Thumbnail)? preloaded = null;
+                 if (layer.ImagePath is { Length: > 0 } path
+                     && preloadedImages is not null
+@@ -863,7 +969,8 @@ public partial class DesignViewModel : ObservableObject
+                 layer.TranslateXMm,
+                 layer.TranslateYMm,
+                 layer.RotationDeg,
+-                layer.Scale * (Math.Max(layer.BaseWidthMm, layer.BaseHeightMm) / (2 * ContentOuterRadiusMm))))
++                layer.Scale * (Math.Max(layer.BaseWidthMm, layer.BaseHeightMm) / (2 * ContentOuterRadiusMm)),
++                layer.CaptureStereo()))
+             .ToList();
+ 
+     // ---- Composite pipeline ----
+@@ -888,14 +995,22 @@ public partial class DesignViewModel : ObservableObject
+         {
+             if (layer.IsVisible && layer.HasImage)
+             {
+-                items.Add(new DesignLayerRenderItem(
+-                    layer.Image!,
+-                    layer.BaseWidthMm,
+-                    layer.BaseHeightMm,
+-                    layer.TranslateXMm,
+-                    layer.TranslateYMm,
+-                    layer.RotationDeg,
+-                    layer.Scale));
++                // DVD stereo layers repeated round the disc are previewed as rotated copies;
++                // generation writes them through the stereo overlay.
++                int copies = layer.IsStereo && Family == OpticalDiscFamily.Dvd ? layer.StereoCopies : 1;
++                for (int copy = 0; copy < copies; copy++)
++                {
++                    double angle = 2 * Math.PI * copy / copies;
++                    double cos = Math.Cos(angle), sin = Math.Sin(angle);
++                    items.Add(new DesignLayerRenderItem(
++                        layer.Image!,
++                        layer.BaseWidthMm,
++                        layer.BaseHeightMm,
++                        layer.TranslateXMm * cos - layer.TranslateYMm * sin,
++                        layer.TranslateXMm * sin + layer.TranslateYMm * cos,
++                        layer.RotationDeg + 360.0 * copy / copies,
++                        layer.Scale));
++                }
+             }
+         }
+ 
+@@ -1023,12 +1138,16 @@ public partial class DesignViewModel : ObservableObject
+         }
+ 
+         List<DesignLayerRenderItem> items = BuildRenderItems();
++        List<DvdImageSolver.Solver.StereoLayerSpec> stereo = BuildStereoSpecs();
+         string outputPath = TempFiles.GetCacheFilePath($"design-composite-{GetFamilyCacheTag(Family)}-export.png");
+         await StaWorker.RunAsync(() =>
+         {
+             DesignComposer.Render(items, CanvasOuterRadiusMm, RingImageQuality.GenerationSize, outputPath);
+             return 0;
+         });
++        // The DVD engine picks stereo layers up from this sidecar; writing an empty list
++        // removes a stale one left by an earlier export of the same cache path.
++        DvdImageSolver.Solver.StereoOverlay.WriteSidecar(outputPath, stereo);
+ 
+         _exportRenderedRevision = _compositeRevision;
+         _lastExportPath = outputPath;
+diff --git a/src/DiscImageStudio.App/Views/DesignView.xaml b/src/DiscImageStudio.App/Views/DesignView.xaml
+index 7ce0b51..6b93869 100644
+--- a/src/DiscImageStudio.App/Views/DesignView.xaml
++++ b/src/DiscImageStudio.App/Views/DesignView.xaml
+@@ -56,6 +56,78 @@
+                            Text="{Binding ImagePath, Mode=OneWay}"
+                            TextTrimming="CharacterEllipsis"
+                            ToolTip="{Binding ImagePath, Mode=OneWay}" />
++                <!-- DVD multi-view stereo: each view gets its own along-track grating byte and
++                     therefore its own diffraction angle (lenticular-card style, white light). -->
++                <StackPanel Margin="0,14,0,0"
++                            Visibility="{Binding DataContext.IsDvd, RelativeSource={RelativeSource AncestorType=UserControl}, Converter={StaticResource BoolToVisibility}}">
++                    <CheckBox Content="{loc:Text Xaml.StereoLayer}" IsChecked="{Binding IsStereo}"
++                              ToolTip="{loc:Text Xaml.StereoLayerHint}" />
++                    <StackPanel Margin="0,10,0,0" Visibility="{Binding IsStereo, Converter={StaticResource BoolToVisibility}}">
++                        <TextBlock Style="{StaticResource FieldLabel}" Text="{loc:Text Xaml.StereoViewSource}" />
++                        <TextBlock Style="{StaticResource HintText}" TextWrapping="Wrap" Margin="0,0,0,6"
++                                   Text="{Binding StereoSummary, Mode=OneWay}" />
++                        <WrapPanel Margin="0,0,0,10">
++                            <Button Style="{StaticResource CompactButton}" Margin="0,0,6,6"
++                                    Content="{loc:Text Xaml.StereoChooseViews}"
++                                    ToolTip="{loc:Text Xaml.StereoChooseViewsHint}"
++                                    Command="{Binding DataContext.ChooseStereoViewsCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" />
++                            <Button Style="{StaticResource CompactButton}" Margin="0,0,6,6"
++                                    Content="{loc:Text Xaml.StereoClearViews}"
++                                    Visibility="{Binding HasStereoViewFiles, Converter={StaticResource BoolToVisibility}}"
++                                    Command="{Binding DataContext.ClearStereoViewsCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" />
++                            <Button Style="{StaticResource CompactButton}" Margin="0,0,6,6"
++                                    Content="{loc:Text Xaml.StereoChooseDepth}"
++                                    ToolTip="{loc:Text Xaml.StereoChooseDepthHint}"
++                                    Visibility="{Binding StereoViewsEditable, Converter={StaticResource BoolToVisibility}}"
++                                    Command="{Binding DataContext.ChooseStereoDepthCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" />
++                            <Button Style="{StaticResource CompactButton}" Margin="0,0,6,6"
++                                    Content="{loc:Text Xaml.StereoClearDepth}"
++                                    Visibility="{Binding HasStereoDepthMap, Converter={StaticResource BoolToVisibility}}"
++                                    Command="{Binding DataContext.ClearStereoDepthCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" />
++                        </WrapPanel>
++                        <Grid Margin="0,0,0,10">
++                            <Grid.ColumnDefinitions>
++                                <ColumnDefinition Width="*" />
++                                <ColumnDefinition Width="12" />
++                                <ColumnDefinition Width="*" />
++                            </Grid.ColumnDefinitions>
++                            <Grid.RowDefinitions>
++                                <RowDefinition Height="Auto" />
++                                <RowDefinition Height="12" />
++                                <RowDefinition Height="Auto" />
++                            </Grid.RowDefinitions>
++                            <StackPanel Grid.Row="0" Grid.Column="0">
++                                <TextBlock Style="{StaticResource FieldLabel}" Text="{loc:Text Xaml.StereoViews}" />
++                                <TextBox Style="{StaticResource CompactTextBox}" IsEnabled="{Binding StereoViewsEditable}"
++                                         Text="{Binding StereoViews, UpdateSourceTrigger=LostFocus}" />
++                            </StackPanel>
++                            <StackPanel Grid.Row="0" Grid.Column="2">
++                                <TextBlock Style="{StaticResource FieldLabel}" Text="{loc:Text Xaml.StereoParallax}" />
++                                <TextBox Style="{StaticResource CompactTextBox}" IsEnabled="{Binding HasStereoDepthMap}"
++                                         ToolTip="{loc:Text Xaml.StereoParallaxHint}"
++                                         Text="{Binding StereoParallaxMm, UpdateSourceTrigger=LostFocus, StringFormat={}{0:F2}}" />
++                            </StackPanel>
++                            <StackPanel Grid.Row="2" Grid.Column="0">
++                                <TextBlock Style="{StaticResource FieldLabel}" Text="{loc:Text Xaml.StereoCell}" />
++                                <TextBox Style="{StaticResource CompactTextBox}" ToolTip="{loc:Text Xaml.StereoCellHint}"
++                                         Text="{Binding StereoHogelMm, UpdateSourceTrigger=LostFocus, StringFormat={}{0:F2}}" />
++                            </StackPanel>
++                            <StackPanel Grid.Row="2" Grid.Column="2">
++                                <TextBlock Style="{StaticResource FieldLabel}" Text="{loc:Text Xaml.StereoCopies}" />
++                                <TextBox Style="{StaticResource CompactTextBox}" ToolTip="{loc:Text Xaml.StereoCopiesHint}"
++                                         Text="{Binding StereoCopies, UpdateSourceTrigger=LostFocus}" />
++                            </StackPanel>
++                        </Grid>
++                        <CheckBox Content="{loc:Text Xaml.StereoReverse}" IsChecked="{Binding StereoReverseViews}"
++                                  ToolTip="{loc:Text Xaml.StereoReverseHint}" Margin="0,0,0,8" />
++                        <Button Style="{StaticResource CompactButton}" HorizontalAlignment="Left" Margin="0,0,0,8"
++                                Content="{loc:Text Xaml.StereoOrientOutward}"
++                                ToolTip="{loc:Text Xaml.StereoOrientOutwardHint}"
++                                Command="{Binding DataContext.OrientOutwardCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" />
++                        <TextBlock Style="{StaticResource HintText}" TextWrapping="Wrap"
++                                   Text="{loc:Text Xaml.StereoViewingHint}" />
++                    </StackPanel>
++                </StackPanel>
+             </StackPanel>
+         </DataTemplate>
+     </UserControl.Resources>
+diff --git a/src/DiscImageStudio.Core/ProjectJsonStore.cs b/src/DiscImageStudio.Core/ProjectJsonStore.cs
+index 40b91c9..274f1c6 100644
+--- a/src/DiscImageStudio.Core/ProjectJsonStore.cs
++++ b/src/DiscImageStudio.Core/ProjectJsonStore.cs
+@@ -28,7 +28,30 @@ public sealed record ProjectLayer(
+     double TranslateXMm,
+     double TranslateYMm,
+     double RotationDeg,
+-    double Scale);
++    double Scale,
++    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
++    ProjectStereoSettings? Stereo = null);
++
++/// <summary>DVD multi-view (lenticular-style) stereo settings of a design layer. When
++/// <see cref="ViewPaths"/> is empty the layer's own image is used for every view, shifted by
++/// <see cref="DepthMapPath"/> when one is given. Saved only for layers that ever had stereo on.</summary>
++public sealed record ProjectStereoSettings(
++    bool Enabled,
++    IReadOnlyList<string>? ViewPaths,
++    string? DepthMapPath,
++    int Views = 4,
++    double ParallaxMm = 1.0,
++    double HogelMm = 0.2,
++    int Copies = 1,
++    bool ReverseViews = false)
++{
++    public const int MinViews = 2;
++    public const int MaxViews = 7;
++    public const double MinHogelMm = 0.02;
++    public const double MaxHogelMm = 5;
++    public const int MaxCopies = 72;
++    public const double MaxParallaxMm = 50;
++}
+ 
+ /// <summary>Where the next generation job writes, and the per-family output switches.</summary>
+ public sealed record ProjectOutputs(
+@@ -379,6 +402,19 @@ public static class ProjectJsonStore
+             {
+                 throw DiagnosticMessage.InvalidData($"图层 '{layer.Id}' 的 scale 必须是大于 0 的有限数值。");
+             }
++
++            if (layer.Stereo is { } stereo)
++            {
++                int viewCount = stereo.ViewPaths is { Count: > 0 } paths ? paths.Count : stereo.Views;
++                if (viewCount is < ProjectStereoSettings.MinViews or > ProjectStereoSettings.MaxViews
++                    || stereo.ViewPaths?.Any(string.IsNullOrWhiteSpace) == true
++                    || !(stereo.HogelMm >= ProjectStereoSettings.MinHogelMm && stereo.HogelMm <= ProjectStereoSettings.MaxHogelMm)
++                    || stereo.Copies is < 1 or > ProjectStereoSettings.MaxCopies
++                    || !(stereo.ParallaxMm >= 0 && stereo.ParallaxMm <= ProjectStereoSettings.MaxParallaxMm))
++                {
++                    throw DiagnosticMessage.InvalidData($"图层 '{layer.Id}' 的 stereo 设置无效。");
++                }
++            }
+         }
+     }
+ 
+diff --git a/src/DvdImageSolver/Solver/FastDispersionImageWriter.cs b/src/DvdImageSolver/Solver/FastDispersionImageWriter.cs
+index 43c2316..048693a 100644
+--- a/src/DvdImageSolver/Solver/FastDispersionImageWriter.cs
++++ b/src/DvdImageSolver/Solver/FastDispersionImageWriter.cs
+@@ -63,7 +63,7 @@ public static class FastDispersionImageWriter
+         cancellationToken.ThrowIfCancellationRequested();
+         Validate(options);
+         RasterImage image = RasterImage.Load(imagePath);
+-        PayloadImageSampler sampler = new(image, options.ImageMapping);
++        PayloadImageSampler sampler = new(image, options.ImageMapping, StereoOverlay.TryLoadForImage(imagePath));
+         int totalBlocks = checked((int)(options.FillSectors / DvdEccBlockEncoder.SectorCount));
+         int parallelism = options.FastParallelism == 0
+             ? Environment.ProcessorCount
+@@ -136,7 +136,7 @@ public static class FastDispersionImageWriter
+     {
+         ValidateStream(output, options);
+         RasterImage image = RasterImage.Load(imagePath);
+-        PayloadImageSampler sampler = new(image, options.ImageMapping);
++        PayloadImageSampler sampler = new(image, options.ImageMapping, StereoOverlay.TryLoadForImage(imagePath));
+         return WriteSampledStream(sampler, output, options, progress, cancellationToken);
+     }
+ 
+@@ -374,8 +374,10 @@ public static class FastDispersionImageWriter
+             ? stackalloc byte[DvdEccBlockEncoder.PayloadBytesPerSector] : Span<byte>.Empty;
+         ulong blockFirstGlobalBit = (ulong)lba * DvdEccBlockEncoder.ChannelBitsPerSector;
+         uint firstPsn = checked(lba + options.PsnOffset);
+-        bool useSimd = options.UseSimdSampling && sampler.SupportsSimdSampling;
+-        bool useReuse = options.UseSampleReuse && sampler.SupportsSampleReuse;
++        bool stereoBlock = sampler.StereoTouchesBlock(blockFirstGlobalBit,
++            blockFirstGlobalBit + (ulong)DvdEccBlockEncoder.SectorCount * DvdEccBlockEncoder.ChannelBitsPerSector);
++        bool useSimd = options.UseSimdSampling && sampler.SupportsSimdSampling && !stereoBlock;
++        bool useReuse = options.UseSampleReuse && sampler.SupportsSampleReuse && !stereoBlock;
+         PixelSample cachedSample = default;
+         double reusableUntil = double.NegativeInfinity;
+         int reuseMisses = 0;
+@@ -566,6 +568,7 @@ public static class FastDispersionImageWriter
+         private readonly double _startAngleRadians;
+         private readonly double _direction;
+         private readonly CalibrationReferenceImageSampler? _referenceImage;
++        private readonly StereoOverlay? _stereo;
+         private readonly bool _supportsReuseGeometry;
+         private readonly double _reusePositionMargin;
+         private readonly double _reuseTangentMargin;
+@@ -581,10 +584,22 @@ public static class FastDispersionImageWriter
+         internal bool SupportsSampleReuse => _supportsReuseGeometry
+             && (_referenceImage is not null || _image is not null);
+ 
+-        internal PayloadImageSampler(RasterImage image, ImageMappingOptions options)
++        /// <summary>Stereo layers are sampled per payload word, so a block whose radius range
++        /// touches one takes the scalar path; every other block keeps SIMD and reuse.</summary>
++        internal bool StereoTouchesBlock(ulong firstChannelBit, ulong endChannelBit)
++        {
++            if (_stereo is null) return false;
++            double r0 = _spiral.AtArcLengthFast(firstChannelBit * _bitLengthMm).Radius;
++            double r1 = _spiral.AtArcLengthFast(endChannelBit * _bitLengthMm).Radius;
++            const double margin = 0.05;
++            return _stereo.MayCover(Math.Min(r0, r1) - margin, Math.Max(r0, r1) + margin);
++        }
++
++        internal PayloadImageSampler(RasterImage image, ImageMappingOptions options, StereoOverlay? stereo = null)
+             : this(options)
+         {
+             _image = image;
++            _stereo = stereo;
+         }
+ 
+         internal PayloadImageSampler(Func<double, double, byte> sampleGray, ImageMappingOptions options)
+@@ -700,6 +715,12 @@ public static class FastDispersionImageWriter
+         {
+             double xMm = radiusMm * Math.Cos(polarAngle);
+             double yMm = radiusMm * Math.Sin(polarAngle);
++            if (_stereo is not null)
++            {
++                // Canvas coordinates are y-down, like the composed picture and design layers.
++                int stereo = _stereo.Sample(xMm, -yMm, globalChannelBit / 16);
++                if (stereo >= 0) return new PayloadTarget((byte)stereo, 255);
++            }
+             if (_sampleScrambledCodeword is not null)
+                 return new PayloadTarget(_sampleScrambledCodeword(new DvdCodewordSample(
+                     xMm, -yMm, globalChannelBit / 16, trackAngle)), 255);
+diff --git a/src/DvdImageSolver/Solver/StereoOverlay.cs b/src/DvdImageSolver/Solver/StereoOverlay.cs
+new file mode 100644
+index 0000000..c8cb43f
+--- /dev/null
++++ b/src/DvdImageSolver/Solver/StereoOverlay.cs
+@@ -0,0 +1,403 @@
++using System.Text.Json;
++using System.Text.Json.Serialization;
++using DiscImageStudio.ImageIO;
++
++namespace DvdImageSolver.Solver;
++
++/// <summary>One multi-view ("lenticular") stereo layer. Each view is written with its own
++/// scrambled-byte sequence whose EFMPlus mark pattern is a nearly pure along-track grating; the
++/// grating period sends that view to its own diffraction angle (550 nm: 5F 15°, C5DB 19°, F9 23°,
++/// CC67 27°, 6F 31°, DDB6 36°, A5 40°), so a viewer moving along the track direction sees the views
++/// one after another. Coordinates are canvas millimetres from the disc centre, +x right, +y down,
++/// rotation clockwise, exactly like a design layer.</summary>
++/// <param name="ViewPaths">Explicit view images, ordered from the first to the last view. When
++/// null or empty, <paramref name="ImagePath"/> is used for every view, shifted by
++/// <paramref name="DepthMapPath"/> when one is given.</param>
++/// <param name="ParallaxMm">Depth synthesis only: how far the nearest point (white in the depth
++/// map) moves between the two outermost views; the farthest point (black) moves the same
++/// distance the other way.</param>
++/// <param name="HogelMm">Along-layer length of one interleave cell (all views side by side).</param>
++/// <param name="Copies">Repeat the layer this many times round the disc centre, so some copy is
++/// always aligned with the light whatever the disc orientation.</param>
++public sealed record StereoLayerSpec(
++    IReadOnlyList<string>? ViewPaths,
++    string? ImagePath,
++    string? DepthMapPath,
++    int Views,
++    double ParallaxMm,
++    double CenterXMm,
++    double CenterYMm,
++    double WidthMm,
++    double HeightMm,
++    double RotationDeg,
++    double HogelMm = 0.2,
++    int Copies = 1,
++    bool ReverseViews = false,
++    double Gamma = 2.2,
++    double Floor = 0.03);
++
++public sealed record StereoOverlaySpec(int Version, IReadOnlyList<StereoLayerSpec> Layers)
++{
++    public const int CurrentVersion = 1;
++}
++
++/// <summary>Per-codeword override that writes stereo layers on top of the normal dispersion
++/// drawing. It is picked up automatically from a sidecar next to the source picture
++/// (<c>picture.png.stereo.json</c>), so every DVD path that consumes the composed picture (ISO
++/// export, stream burn, CLI) applies it. Thread-safe after construction.</summary>
++public sealed class StereoOverlay
++{
++    public const string SidecarSuffix = ".stereo.json";
++    public const int MinViews = 2;
++    public const int MaxViews = 7;
++    private const int MaxViewWidth = 1024;
++
++    /// <summary>The seven cleanest along-track periods found by spectral search, longest period
++    /// (smallest diffraction angle) first: 2.13, 1.70, 1.43, 1.23, 1.07, 0.93, 0.85 µm.</summary>
++    private static readonly byte[][] AllSequences =
++    [
++        [0x5F], [0xC5, 0xDB], [0xF9], [0xCC, 0x67], [0x6F], [0xDD, 0xB6], [0xA5],
++    ];
++
++    private static readonly int[][] SequencePick =
++    [
++        [0, 6], [0, 3, 6], [0, 2, 4, 6], [0, 1, 3, 5, 6], [0, 1, 2, 4, 5, 6], [0, 1, 2, 3, 4, 5, 6],
++    ];
++
++    internal static readonly JsonSerializerOptions JsonOptions = new()
++    {
++        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
++        WriteIndented = true,
++        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
++    };
++
++    private readonly PreparedLayer[] _layers;
++
++    private StereoOverlay(PreparedLayer[] layers) => _layers = layers;
++
++    public int LayerCount => _layers.Length;
++
++    /// <summary>True when some layer may cover radii in [<paramref name="minRadiusMm"/>,
++    /// <paramref name="maxRadiusMm"/>]; blocks outside keep the fast sampling paths.</summary>
++    public bool MayCover(double minRadiusMm, double maxRadiusMm)
++    {
++        foreach (PreparedLayer layer in _layers)
++            if (maxRadiusMm >= layer.MinRadius && minRadiusMm <= layer.MaxRadius) return true;
++        return false;
++    }
++
++    /// <summary>The scrambled byte sequences used for <paramref name="views"/> views, in view
++    /// order. Exposed for diagnostics and documentation.</summary>
++    public static IReadOnlyList<byte[]> SequencesFor(int views)
++    {
++        if (views is < MinViews or > MaxViews) throw new ArgumentOutOfRangeException(nameof(views));
++        return SequencePick[views - MinViews].Select(index => AllSequences[index]).ToArray();
++    }
++
++    public static string SidecarPathFor(string imagePath) => Path.GetFullPath(imagePath) + SidecarSuffix;
++
++    /// <summary>Writes (or, for an empty layer list, deletes) the sidecar for a source picture.</summary>
++    public static void WriteSidecar(string imagePath, IReadOnlyList<StereoLayerSpec> layers)
++    {
++        string path = SidecarPathFor(imagePath);
++        if (layers.Count == 0)
++        {
++            if (File.Exists(path)) File.Delete(path);
++            return;
++        }
++        foreach (StereoLayerSpec layer in layers) Validate(layer);
++        string temp = path + ".tmp";
++        File.WriteAllText(temp, JsonSerializer.Serialize(
++            new StereoOverlaySpec(StereoOverlaySpec.CurrentVersion, layers), JsonOptions));
++        File.Move(temp, path, overwrite: true);
++    }
++
++    /// <summary>Loads the sidecar of a source picture, or returns null when there is none.</summary>
++    public static StereoOverlay? TryLoadForImage(string imagePath)
++    {
++        string path = SidecarPathFor(imagePath);
++        if (!File.Exists(path)) return null;
++        StereoOverlaySpec spec = JsonSerializer.Deserialize<StereoOverlaySpec>(File.ReadAllText(path), JsonOptions)
++            ?? throw new InvalidDataException("Empty stereo sidecar: " + path);
++        if (spec.Version != StereoOverlaySpec.CurrentVersion)
++            throw new InvalidDataException($"Unsupported stereo sidecar version {spec.Version}: {path}");
++        return spec.Layers is { Count: > 0 } ? Create(spec.Layers) : null;
++    }
++
++    public static StereoOverlay Create(IReadOnlyList<StereoLayerSpec> layers)
++    {
++        ArgumentNullException.ThrowIfNull(layers);
++        return new StereoOverlay(layers.Select(Prepare).ToArray());
++    }
++
++    public static void Validate(StereoLayerSpec layer)
++    {
++        ArgumentNullException.ThrowIfNull(layer);
++        bool hasViews = layer.ViewPaths is { Count: > 0 };
++        if (!hasViews && string.IsNullOrWhiteSpace(layer.ImagePath))
++            throw new ArgumentException("A stereo layer needs view images or a source image.");
++        int views = hasViews ? layer.ViewPaths!.Count : layer.Views;
++        if (views is < MinViews or > MaxViews)
++            throw new ArgumentOutOfRangeException(nameof(layer), $"A stereo layer needs {MinViews}..{MaxViews} views.");
++        if (!(layer.WidthMm > 0) || !(layer.HeightMm > 0) || !double.IsFinite(layer.WidthMm) || !double.IsFinite(layer.HeightMm))
++            throw new ArgumentOutOfRangeException(nameof(layer), "Stereo layer size must be positive.");
++        if (!double.IsFinite(layer.CenterXMm) || !double.IsFinite(layer.CenterYMm) || !double.IsFinite(layer.RotationDeg))
++            throw new ArgumentOutOfRangeException(nameof(layer), "Stereo layer placement must be finite.");
++        if (!(layer.HogelMm >= 0.02 && layer.HogelMm <= 5))
++            throw new ArgumentOutOfRangeException(nameof(layer), "Stereo cell length must be 0.02..5 mm.");
++        if (layer.Copies is < 1 or > 72)
++            throw new ArgumentOutOfRangeException(nameof(layer), "Stereo copies must be 1..72.");
++        if (!(layer.ParallaxMm >= 0 && layer.ParallaxMm <= 50))
++            throw new ArgumentOutOfRangeException(nameof(layer), "Stereo parallax must be 0..50 mm.");
++        if (!(layer.Gamma > 0 && layer.Gamma <= 5) || !(layer.Floor >= 0 && layer.Floor < 1))
++            throw new ArgumentOutOfRangeException(nameof(layer), "Stereo gamma or floor is out of range.");
++    }
++
++    /// <summary>Returns the scrambled byte for a payload word, or -1 when no stereo layer covers
++    /// it. <paramref name="xMm"/>/<paramref name="yMm"/> are canvas millimetres (+y down).</summary>
++    public int Sample(double xMm, double yMm, ulong globalCodewordIndex)
++    {
++        double r = Math.Sqrt(xMm * xMm + yMm * yMm);
++        foreach (PreparedLayer layer in _layers)
++        {
++            if (r < layer.MinRadius || r > layer.MaxRadius) continue;
++            int value = layer.Sample(xMm, yMm, globalCodewordIndex);
++            if (value >= 0) return value;
++        }
++        return -1;
++    }
++
++    // ---- preparation ----
++
++    private static PreparedLayer Prepare(StereoLayerSpec spec)
++    {
++        Validate(spec);
++        float[][] views;
++        bool[] mask;
++        int width, height;
++        if (spec.ViewPaths is { Count: > 0 } paths)
++        {
++            Gray first = LoadGray(paths[0], spec.Gamma, MaxViewWidth);
++            width = first.Width; height = first.Height;
++            views = new float[paths.Count][];
++            mask = new bool[width * height];
++            for (int k = 0; k < paths.Count; k++)
++            {
++                Gray g = k == 0 ? first : Resize(LoadGray(paths[k], spec.Gamma, MaxViewWidth), width, height);
++                views[k] = g.Value;
++                for (int i = 0; i < mask.Length; i++) mask[i] |= g.Opaque[i];
++            }
++        }
++        else
++        {
++            Gray source = LoadGray(spec.ImagePath!, spec.Gamma, MaxViewWidth);
++            width = source.Width; height = source.Height;
++            float[]? depth = null;
++            if (!string.IsNullOrWhiteSpace(spec.DepthMapPath))
++            {
++                Gray d = Resize(LoadGray(spec.DepthMapPath!, 1.0, MaxViewWidth), width, height);
++                depth = d.Value;
++            }
++            views = new float[spec.Views][];
++            mask = (bool[])source.Opaque.Clone();
++            double pxPerMm = width / spec.WidthMm;
++            for (int k = 0; k < spec.Views; k++)
++            {
++                double offset = spec.Views == 1 ? 0 : 2.0 * k / (spec.Views - 1) - 1.0;   // -1 .. 1
++                if (depth is null || spec.ParallaxMm <= 0)
++                {
++                    views[k] = source.Value;
++                    continue;
++                }
++                double shiftAtNear = offset * spec.ParallaxMm / 2 * pxPerMm;              // px for depth = 1
++                (views[k], bool[] warpedMask) = Warp(source, depth, shiftAtNear);
++                for (int i = 0; i < mask.Length; i++) mask[i] |= warpedMask[i];
++            }
++        }
++
++        if (spec.ReverseViews) Array.Reverse(views);
++        float floor = (float)spec.Floor;
++        foreach (float[] view in views)
++            for (int i = 0; i < view.Length; i++)
++                if (view[i] < floor) view[i] = 0;
++
++        int n = views.Length;
++        byte[][] sequences = SequencesFor(n).ToArray();
++        return new PreparedLayer(spec, width, height, views, mask, sequences);
++    }
++
++    private sealed record Gray(int Width, int Height, float[] Value, bool[] Opaque);
++
++    /// <summary>Linear intensity (0..1) and opacity. Transparent pixels read as 0.</summary>
++    private static Gray LoadGray(string path, double gamma, int maxWidth)
++    {
++        BgraRaster raster = RasterCodec.LoadBgra32(path);
++        int w = raster.Width, h = raster.Height;
++        float[] value = new float[w * h];
++        bool[] opaque = new bool[w * h];
++        byte[] px = raster.Pixels;
++        for (int i = 0; i < value.Length; i++)
++        {
++            int o = i * 4;
++            double lum = (0.114 * px[o] + 0.587 * px[o + 1] + 0.299 * px[o + 2]) / 255.0;
++            bool isOpaque = px[o + 3] >= 128;
++            opaque[i] = isOpaque;
++            value[i] = isOpaque ? (float)Math.Pow(lum, gamma) : 0f;
++        }
++        Gray g = new(w, h, value, opaque);
++        if (w > maxWidth) g = Resize(g, maxWidth, Math.Max(1, (int)Math.Round((double)h * maxWidth / w)));
++        return g;
++    }
++
++    /// <summary>Box/bilinear resample to an exact size (views may come at slightly different sizes).</summary>
++    private static Gray Resize(Gray g, int w, int h)
++    {
++        if (g.Width == w && g.Height == h) return g;
++        float[] value = new float[w * h];
++        bool[] opaque = new bool[w * h];
++        double sx = (double)g.Width / w, sy = (double)g.Height / h;
++        for (int y = 0; y < h; y++)
++        {
++            int y0 = (int)(y * sy), y1 = Math.Max(y0 + 1, (int)((y + 1) * sy));
++            for (int x = 0; x < w; x++)
++            {
++                int x0 = (int)(x * sx), x1 = Math.Max(x0 + 1, (int)((x + 1) * sx));
++                double sum = 0; int count = 0, opaqueCount = 0;
++                for (int yy = y0; yy < Math.Min(y1, g.Height); yy++)
++                    for (int xx = x0; xx < Math.Min(x1, g.Width); xx++)
++                    {
++                        int i = yy * g.Width + xx;
++                        sum += g.Value[i]; count++;
++                        if (g.Opaque[i]) opaqueCount++;
++                    }
++                value[y * w + x] = count == 0 ? 0 : (float)(sum / count);
++                opaque[y * w + x] = opaqueCount * 2 >= Math.Max(count, 1);
++            }
++        }
++        return new Gray(w, h, value, opaque);
++    }
++
++    /// <summary>Forward-warps one view: each pixel moves horizontally by
++    /// <c>shiftAtNear · (2·depth − 1)</c>; nearer pixels win, holes take the farther neighbour.</summary>
++    private static (float[] Value, bool[] Mask) Warp(Gray source, float[] depth, double shiftAtNear)
++    {
++        int w = source.Width, h = source.Height;
++        float[] value = new float[w * h];
++        bool[] mask = new bool[w * h];
++        float[] zbuf = new float[w];
++        bool[] filled = new bool[w];
++        for (int y = 0; y < h; y++)
++        {
++            Array.Fill(zbuf, float.NegativeInfinity);
++            Array.Clear(filled);
++            int row = y * w;
++            for (int x = 0; x < w; x++)
++            {
++                float d = depth[row + x];
++                int tx = (int)Math.Round(x + shiftAtNear * (2 * d - 1));
++                if ((uint)tx >= (uint)w || d < zbuf[tx]) continue;
++                zbuf[tx] = d;
++                filled[tx] = true;
++                value[row + tx] = source.Value[row + x];
++                mask[row + tx] = source.Opaque[row + x];
++            }
++            for (int x = 0; x < w; x++)
++            {
++                if (filled[x]) continue;
++                int left = x - 1, right = x + 1;
++                while (left >= 0 && !filled[left]) left--;
++                while (right < w && !filled[right]) right++;
++                int pick = left < 0 ? right : right >= w ? left : zbuf[left] <= zbuf[right] ? left : right;
++                if (pick < 0 || pick >= w) continue;
++                value[row + x] = value[row + pick];
++                mask[row + x] = mask[row + pick];
++            }
++        }
++        return (value, mask);
++    }
++
++    private sealed class PreparedLayer
++    {
++        private readonly int _width, _height, _views, _copies;
++        private readonly float[][] _value;
++        private readonly bool[] _mask;
++        private readonly byte[][] _sequences;
++        private readonly double _cx, _cy, _w, _h, _cos, _sin, _hogel, _centerAngle, _copyStep;
++        private readonly double[] _backCos, _backSin;
++
++        internal PreparedLayer(StereoLayerSpec spec, int width, int height, float[][] value, bool[] mask, byte[][] sequences)
++        {
++            _width = width; _height = height; _value = value; _mask = mask; _sequences = sequences;
++            _views = value.Length;
++            _cx = spec.CenterXMm; _cy = spec.CenterYMm; _w = spec.WidthMm; _h = spec.HeightMm;
++            double a = spec.RotationDeg * Math.PI / 180;
++            _cos = Math.Cos(a); _sin = Math.Sin(a);
++            _hogel = spec.HogelMm;
++            _copies = spec.Copies;
++            _copyStep = 2 * Math.PI / _copies;
++            _backCos = new double[_copies]; _backSin = new double[_copies];
++            for (int c = 0; c < _copies; c++) { _backCos[c] = Math.Cos(-c * _copyStep); _backSin[c] = Math.Sin(-c * _copyStep); }
++            _centerAngle = Math.Atan2(_cy, _cx);
++            double centerRadius = Math.Sqrt(_cx * _cx + _cy * _cy);
++            double halfDiagonal = Math.Sqrt(_w * _w + _h * _h) / 2;
++            MinRadius = Math.Max(0, centerRadius - halfDiagonal);
++            MaxRadius = centerRadius + halfDiagonal;
++        }
++
++        internal double MinRadius { get; }
++
++        internal double MaxRadius { get; }
++
++        internal int Sample(double x, double y, ulong codeword)
++        {
++            if (_copies == 1) return SampleCopy(x, y, codeword);
++            // Nearest copy first, then its neighbours (wide layers can overlap the next copy).
++            double phi = Math.Atan2(y, x) - _centerAngle;
++            int nearest = (int)Math.Round(phi / _copyStep);
++            for (int delta = 0; delta <= 2; delta++)
++            {
++                int c = delta == 0 ? nearest : delta == 1 ? nearest - 1 : nearest + 1;
++                c = ((c % _copies) + _copies) % _copies;            // rotate the point back onto copy 0
++                double cb = _backCos[c], sb = _backSin[c];
++                int value = SampleCopy(x * cb - y * sb, x * sb + y * cb, codeword);
++                if (value >= 0) return value;
++            }
++            return -1;
++        }
++
++        private int SampleCopy(double x, double y, ulong codeword)
++        {
++            double dx = x - _cx, dy = y - _cy;
++            // Inverse of a clockwise (y-down) rotation.
++            double lx = dx * _cos + dy * _sin;
++            double ly = -dx * _sin + dy * _cos;
++            double u = lx / _w + 0.5, v = ly / _h + 0.5;
++            if (u < 0 || u >= 1 || v < 0 || v >= 1) return -1;
++            int iy = Math.Min((int)(v * _height), _height - 1);
++            int ix = Math.Min((int)(u * _width), _width - 1);
++            if (!_mask[iy * _width + ix]) return -1;
++
++            double s = (lx + _w / 2) / _hogel;
++            double cell = Math.Floor(s);
++            double p = (s - cell) * _views;
++            int slot = Math.Min((int)p, _views - 1);
++            double duty = p - slot;
++            double cellCentre = ((cell + 0.5) * _hogel) / _w;           // u of the cell centre
++            int icx = Math.Clamp((int)(cellCentre * _width), 0, _width - 1);
++            float intensity = _value[slot][iy * _width + icx];
++            if (duty < intensity)
++            {
++                byte[] seq = _sequences[slot];
++                return seq[(int)(codeword % (ulong)seq.Length)];
++            }
++            return NoiseByte(codeword);
++        }
++
++        private static int NoiseByte(ulong codeword)
++        {
++            ulong h = (codeword + 0x632BE59BD9B4E019UL) * 0x9E3779B97F4A7C15UL;
++            h ^= h >> 29; h *= 0xBF58476D1CE4E5B9UL; h ^= h >> 32;
++            return (byte)h;
++        }
++    }
++}
+-- 
+2.43.0
+

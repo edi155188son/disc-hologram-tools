@@ -1,0 +1,20 @@
+# build output
+artifacts/
+bin/
+obj/
+# the DIS checkout used for building (submodule or clone)
+external/DiscImageStudio/
+# generated disc data (large)
+*.iso
+*.bdaf
+*.bdopt
+*.bdch
+*.hpo
+*.bdhr
+*.val
+*.mat
+__pycache__/
+*.pyc
+.venv/
+# per-design simulation images written next to the MATLAB scripts
+*_sim.png

@@ -1,0 +1,32 @@
+From 69277e4416ee4f377be71be7f3505e6b96e05976 Mon Sep 17 00:00:00 2001
+From: Hologram Tools <noreply@example.invalid>
+Date: Thu, 26 Nov 2026 01:50:26 +0800
+Subject: [PATCH] BD: do not cap parallel cluster workers at 16
+
+The batched BD generators used min(16, cores - 1) workers. On machines with more
+than 17 logical processors the extra cores stayed idle during full-disc generation
+(about 25 GB). The batch buffers are workers * 2 clusters of 64 KiB, so removing
+the cap does not change memory use noticeably. Output bytes and ordering are
+unchanged (ordered write-out on the calling thread).
+
+Local patch: not benchmarked beyond one machine; submit upstream only with numbers.
+---
+ src/DiscImageStudio.BluRay/BluRayStreamingGenerator.cs | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/DiscImageStudio.BluRay/BluRayStreamingGenerator.cs b/src/DiscImageStudio.BluRay/BluRayStreamingGenerator.cs
+index f6cfe23..55b28d8 100644
+--- a/src/DiscImageStudio.BluRay/BluRayStreamingGenerator.cs
++++ b/src/DiscImageStudio.BluRay/BluRayStreamingGenerator.cs
+@@ -64,7 +64,7 @@ public static class BluRayStreamingGenerator
+         // Built-in raster and explicitly thread-safe pattern samplers share
+         // the same bounded batches. Other mappings retain sequential invocation.
+         int workers = mapping is IBluRayBatchPayloadMapping batch && batch.CanGenerateInParallel(options.Disc)
+-            ? Math.Min(16, Math.Max(1, Environment.ProcessorCount - 1)) : 1;
++            ? Math.Max(1, Environment.ProcessorCount - 1) : 1;
+         int batchCapacity = (int)Math.Min(options.SectorCount / 32, (uint)(workers == 1 ? 1 : workers * 2));
+         byte[][] clusters = new byte[batchCapacity][];
+         for (int i = 0; i < clusters.Length; i++)
+-- 
+2.43.0
+

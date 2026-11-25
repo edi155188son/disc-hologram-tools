@@ -1,0 +1,155 @@
+From 1c318d46dca830f6c60d5de2f78ac042fb96b9d4 Mon Sep 17 00:00:00 2001
+From: Hologram Tools <noreply@example.invalid>
+Date: Thu, 26 Nov 2026 01:49:11 +0800
+Subject: [PATCH 2/2] BD: optional per-cluster post-processing hook in
+ BluRayStreamingOptions
+
+Add BluRayStreamingOptions.ClusterPostProcessor (delegate BluRayClusterPostProcessor).
+When set, the streaming generator calls it once per 32-sector cluster after the
+payload mapping has filled the cluster and before the per-cluster scrambler is
+removed, i.e. on the values that end up on the disc. Research tools use it to
+solve for LDC parity bytes that land inside a pattern (the parity is GF(2)-linear
+in the payload, so free bytes outside the pattern can be adjusted).
+
+The hook is a per-call option, not global state, and is null for every built-in
+caller. FillCluster is split into 'fill all sectors' and 'remove scrambler'
+loops so the hook sees the complete cluster; with no hook the output bytes and
+cancellation points are unchanged.
+
+Test: BluRayParallelGenerationTests flips all bytes in the hook and checks the
+output on the sequential and the parallel path, and that the hook runs exactly
+once per cluster with the right first sector / PSN.
+---
+ .../BluRayStreamingGenerator.cs               | 31 ++++++++++++----
+ .../BluRayParallelGenerationTests.cs          | 37 +++++++++++++++++++
+ 2 files changed, 60 insertions(+), 8 deletions(-)
+
+diff --git a/src/DiscImageStudio.BluRay/BluRayStreamingGenerator.cs b/src/DiscImageStudio.BluRay/BluRayStreamingGenerator.cs
+index f6cfe23..c207f33 100644
+--- a/src/DiscImageStudio.BluRay/BluRayStreamingGenerator.cs
++++ b/src/DiscImageStudio.BluRay/BluRayStreamingGenerator.cs
+@@ -29,8 +29,19 @@ public sealed class BluRayConstantByteMapping(byte value) : IBluRayPayloadMappin
+     public void FillScrambledPayload(BluRaySectorContext context, Span<byte> destination) => destination.Fill(Value);
+ }
+ 
++/// <summary>Optional last edit of a complete 32-sector cluster payload, called once per cluster after the
++/// mapping has filled it and before the per-cluster scrambler is removed, so <paramref name="cluster"/>
++/// holds the values that end up on the disc (post-scrambler domain, 32 x 2048 bytes).
++/// It may be invoked concurrently for different clusters and must be thread-safe.</summary>
++public delegate void BluRayClusterPostProcessor(BluRayDiscParameters disc, uint firstSector,
++    uint physicalSectorNumber, Span<byte> cluster);
++
+ public sealed record BluRayStreamingOptions(BluRayDiscParameters Disc, uint StartSector = 0, uint SectorCount = 32)
+ {
++    /// <summary>Hook for research tools that need to post-process whole clusters (for example to make the
++    /// drive-generated parity bytes follow a pattern). Null for every built-in caller.</summary>
++    public BluRayClusterPostProcessor? ClusterPostProcessor { get; init; }
++
+     public long ContentLength => (long)SectorCount * BluRayDiscParameters.BytesPerSector;
+     public void Validate()
+     {
+@@ -75,10 +86,10 @@ public static class BluRayStreamingGenerator
+             cancellationToken.ThrowIfCancellationRequested();
+             int count = (int)Math.Min((options.SectorCount - offset) / 32, (uint)batchCapacity);
+             if (workers == 1 || count == 1)
+-                FillCluster(clusters[0], options.Disc, options.StartSector + offset, mapping!, cancellationToken);
++                FillCluster(clusters[0], options.Disc, options.StartSector + offset, mapping!, options.ClusterPostProcessor, cancellationToken);
+             else
+                 Parallel.For(0, count, parallelOptions, index => FillCluster(clusters[index], options.Disc,
+-                    options.StartSector + offset + (uint)index * 32, mapping!, cancellationToken));
++                    options.StartSector + offset + (uint)index * 32, mapping!, options.ClusterPostProcessor, cancellationToken));
+             // A batch contains at most 32 clusters (2 MiB). All output and
+             // progress callbacks stay ordered on the calling thread. Workers
+             // have joined before a slow consumer can block the next batch.
+@@ -96,7 +107,7 @@ public static class BluRayStreamingGenerator
+     }
+ 
+     private static void FillCluster(byte[] cluster, BluRayDiscParameters disc, uint firstSector,
+-        IBluRayPayloadMapping mapping, CancellationToken cancellationToken)
++        IBluRayPayloadMapping mapping, BluRayClusterPostProcessor? postProcessor, CancellationToken cancellationToken)
+     {
+         uint psn = disc.GetPhysicalSectorNumber(firstSector);
+         // §13.4 resets to the SAME seed for every sector in a cluster.
+@@ -104,15 +115,19 @@ public static class BluRayStreamingGenerator
+         BluRayScrambler.FillMask(psn, mask);
+         bool filledCluster = mapping is IBluRayBatchPayloadMapping batch
+             && batch.TryFillScrambledCluster(disc, firstSector, cluster, cancellationToken);
++        if (!filledCluster)
++            for (int sector = 0; sector < 32; sector++)
++            {
++                cancellationToken.ThrowIfCancellationRequested();
++                Span<byte> fill = cluster.AsSpan(sector * 2048, 2048);
++                fill.Clear();
++                mapping.FillScrambledPayload(new(firstSector + (uint)sector, psn + (uint)sector, disc), fill);
++            }
++        postProcessor?.Invoke(disc, firstSector, psn, cluster);
+         for (int sector = 0; sector < 32; sector++)
+         {
+             cancellationToken.ThrowIfCancellationRequested();
+             Span<byte> payload = cluster.AsSpan(sector * 2048, 2048);
+-            if (!filledCluster)
+-            {
+-                payload.Clear();
+-                mapping.FillScrambledPayload(new(firstSector + (uint)sector, psn + (uint)sector, disc), payload);
+-            }
+             int index = 0;
+             if (Vector.IsHardwareAccelerated)
+             {
+diff --git a/tests/DiscImageStudio.ArchitectureTests/BluRayParallelGenerationTests.cs b/tests/DiscImageStudio.ArchitectureTests/BluRayParallelGenerationTests.cs
+index 927ad30..9d30061 100644
+--- a/tests/DiscImageStudio.ArchitectureTests/BluRayParallelGenerationTests.cs
++++ b/tests/DiscImageStudio.ArchitectureTests/BluRayParallelGenerationTests.cs
+@@ -10,6 +10,7 @@ internal static class BluRayParallelGenerationTests
+         TestAllThresholdValues();
+         TestIndependentScramble();
+         TestExplicitBytePair();
++        TestClusterPostProcessor();
+         TestCustomMappingsStaySequential();
+         TestCancellationAndOutputFailure();
+         Console.WriteLine("blu-ray-parallel-generation: passed (exact bytes, ordered output, custom mapping isolation, cancellation)");
+@@ -96,6 +97,42 @@ internal static class BluRayParallelGenerationTests
+         }
+     }
+ 
++    private static void TestClusterPostProcessor()
++    {
++        // The hook sees each complete cluster exactly once, in the post-scrambler domain, before the
++        // scrambler is removed: flipping every byte there flips every output byte, on the sequential
++        // and on the parallel (raster) path alike, and leaves the default (no hook) output unchanged.
++        BluRayDiscParameters disc = new();
++        byte[] pixels = new byte[256 * 256];
++        for (int i = 0; i < pixels.Length; i++) pixels[i] = (byte)((i / 5 & 1) == 0 ? 0 : 255);
++        BluRayGray8Raster raster = new(256, 256, pixels);
++        foreach (IBluRayPayloadMapping mapping in new IBluRayPayloadMapping[]
++            { new BluRayConstantByteMapping(0x3c), new BluRayImagePayloadMapping(disc, raster, new BluRayRunLengthMapping(0x9E, 0x22)) })
++        {
++            BluRayStreamingOptions plain = new(disc, 64, 32 * 6);
++            var calls = new System.Collections.Concurrent.ConcurrentBag<(uint First, uint Psn)>();
++            BluRayStreamingOptions hooked = plain with
++            {
++                ClusterPostProcessor = (d, first, psn, cluster) =>
++                {
++                    Require(cluster.Length == BluRayDiscParameters.PayloadBytesPerCluster && ReferenceEquals(d, disc),
++                        "hook receives a whole cluster and the disc parameters");
++                    calls.Add((first, psn));
++                    for (int i = 0; i < cluster.Length; i++) cluster[i] ^= 0xFF;
++                },
++            };
++            using MemoryStream a = new(), b = new();
++            BluRayStreamingGenerator.GenerateToStream(a, plain, mapping);
++            BluRayStreamingGenerator.GenerateToStream(b, hooked, mapping);
++            byte[] pa = a.ToArray(), pb = b.ToArray();
++            Require(pa.Length == pb.Length && pa.Length == 32 * 6 * 2048, "hook keeps the output length");
++            for (int i = 0; i < pa.Length; i++)
++                Require((byte)(pa[i] ^ 0xFF) == pb[i], "hook edits are applied before the scrambler is removed");
++            var expected = Enumerable.Range(0, 6).Select(c => (First: 64U + (uint)c * 32, Psn: disc.GetPhysicalSectorNumber(64U + (uint)c * 32))).ToArray();
++            Require(calls.OrderBy(c => c.First).SequenceEqual(expected), "hook runs exactly once per cluster with its first sector and PSN");
++        }
++    }
++
+     private static void TestIndependentScramble()
+     {
+         BluRayDiscParameters disc = new();
+-- 
+2.43.0
+

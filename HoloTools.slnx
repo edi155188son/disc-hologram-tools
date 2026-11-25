@@ -1,0 +1,12 @@
+<Solution>
+  <Folder Name="/tools/">
+    <Project Path="tools/BdAmp/BdAmp.csproj" />
+    <Project Path="tools/BdCgh/BdCgh.csproj" />
+    <Project Path="tools/DvdDiffractionRings/DvdDiffractionRings.csproj" />
+    <Project Path="tools/HoloCgh/HoloCgh.csproj" />
+    <Project Path="tools/HoloCgh/PhaseProbe/PhaseProbe.csproj" />
+  </Folder>
+  <Folder Name="/experimental/">
+    <Project Path="experimental/BdHolo/BdHolo.csproj" />
+  </Folder>
+</Solution>

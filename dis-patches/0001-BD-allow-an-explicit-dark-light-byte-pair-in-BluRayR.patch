@@ -1,0 +1,135 @@
+From be867010d0393b3b21f7ca3923b90cd76e7790a9 Mon Sep 17 00:00:00 2001
+From: Hologram Tools <noreply@example.invalid>
+Date: Thu, 26 Nov 2026 01:48:45 +0800
+Subject: [PATCH 1/2] BD: allow an explicit dark/light byte pair in
+ BluRayRunLengthMapping
+
+BluRayRunLengthMapping only offered the AA (3T) / 44 (6T) pair, selected by the
+invert flag. Add a (darkByte, lightByte) constructor so experiments can use other
+post-scrambler byte pairs (for example 9E / 22, which gave the clearest
+diffraction in test discs on Verbatim BD-R) while keeping the exact
+luminance threshold and the integer SIMD fast path.
+
+The existing constructor keeps its behaviour: Invert still selects AA/44 or 44/AA.
+Invert is false for a custom pair.
+
+Test: BluRayParallelGenerationTests compares the batched mapping with a scalar
+oracle for the 9E/22 pair over a whole cluster.
+---
+ .../BluRayRunLengthMapping.cs                 | 30 ++++++++++++-----
+ .../BluRayParallelGenerationTests.cs          | 32 +++++++++++++++++++
+ 2 files changed, 54 insertions(+), 8 deletions(-)
+
+diff --git a/src/DiscImageStudio.BluRay/BluRayRunLengthMapping.cs b/src/DiscImageStudio.BluRay/BluRayRunLengthMapping.cs
+index 9dd319d..67651e2 100644
+--- a/src/DiscImageStudio.BluRay/BluRayRunLengthMapping.cs
++++ b/src/DiscImageStudio.BluRay/BluRayRunLengthMapping.cs
+@@ -9,26 +9,40 @@ namespace DiscImageStudio.BluRay;
+ /// counts, not transition density or run-length share. Dark-to-3T is a configurable
+ /// image convention, not a measured optical polarity. ECC, DC control and image
+ /// boundaries introduce other run lengths; this does not produce pure 3T/6T tracks.</remarks>
+-public sealed class BluRayRunLengthMapping(bool invert = false) : IBluRayLuminanceMapping
++public sealed class BluRayRunLengthMapping : IBluRayLuminanceMapping
+ {
+     public const byte ThreeTByte = 0xAA;
+     public const byte SixTByte = 0x44;
+ 
+-    public bool Invert { get; } = invert;
++    private readonly byte _darkByte;
++    private readonly byte _lightByte;
+ 
+-    public byte Map(byte luminance, BluRayPayloadBytePosition position)
++    public BluRayRunLengthMapping(bool invert = false)
++        : this(invert ? SixTByte : ThreeTByte, invert ? ThreeTByte : SixTByte)
++    {
++        Invert = invert;
++    }
++
++    /// <summary>Explicit post-scrambler byte pair for dark (luminance below 128) and light pixels,
++    /// for experiments with byte pairs other than AA/44. Keeps the exact threshold and the
++    /// integer SIMD fast path; <see cref="Invert"/> is false for a custom pair.</summary>
++    public BluRayRunLengthMapping(byte darkByte, byte lightByte)
+     {
+-        bool useThreeT = BinaryGrayscale.GetLevelIndex(luminance) == 0;
+-        if (Invert) useThreeT = !useThreeT;
+-        return useThreeT ? ThreeTByte : SixTByte;
++        _darkByte = darkByte;
++        _lightByte = lightByte;
+     }
+ 
++    public bool Invert { get; }
++
++    public byte Map(byte luminance, BluRayPayloadBytePosition position)
++        => BinaryGrayscale.GetLevelIndex(luminance) == 0 ? _darkByte : _lightByte;
++
+     /// <summary>Maps a completed luminance span with the same exact 128 threshold.
+     /// Integer SIMD does not approximate geometry or move image boundaries.</summary>
+     internal void MapLuminances(Span<byte> luminances)
+     {
+-        byte dark = Invert ? SixTByte : ThreeTByte;
+-        byte light = Invert ? ThreeTByte : SixTByte;
++        byte dark = _darkByte;
++        byte light = _lightByte;
+         int index = 0;
+         if (Vector.IsHardwareAccelerated)
+         {
+diff --git a/tests/DiscImageStudio.ArchitectureTests/BluRayParallelGenerationTests.cs b/tests/DiscImageStudio.ArchitectureTests/BluRayParallelGenerationTests.cs
+index 0caf0d5..927ad30 100644
+--- a/tests/DiscImageStudio.ArchitectureTests/BluRayParallelGenerationTests.cs
++++ b/tests/DiscImageStudio.ArchitectureTests/BluRayParallelGenerationTests.cs
+@@ -9,6 +9,7 @@ internal static class BluRayParallelGenerationTests
+         TestRasterGeometryAgainstScalar();
+         TestAllThresholdValues();
+         TestIndependentScramble();
++        TestExplicitBytePair();
+         TestCustomMappingsStaySequential();
+         TestCancellationAndOutputFailure();
+         Console.WriteLine("blu-ray-parallel-generation: passed (exact bytes, ordered output, custom mapping isolation, cancellation)");
+@@ -69,6 +70,32 @@ internal static class BluRayParallelGenerationTests
+         }
+     }
+ 
++    private static void TestExplicitBytePair()
++    {
++        // A custom dark/light pair must keep the batched SIMD path exactly equal to the scalar oracle
++        // and must not change the default AA/44 behaviour.
++        BluRayDiscParameters disc = new();
++        byte[] pixels = new byte[1024 * 1024];
++        for (int i = 0; i < pixels.Length; i++) pixels[i] = (byte)(((i / 3 + i / 1024) & 1) == 0 ? 20 : 230);
++        BluRayGray8Raster raster = new(1024, 1024, pixels);
++        BluRayRunLengthMapping pair = new(0x9E, 0x22);
++        Require(!pair.Invert, "custom pair is not an inverted AA/44 mapping");
++        BluRayRunLengthMapping defaults = new(), inverted = new(true);
++        Require(defaults.Map(0, default) == BluRayRunLengthMapping.ThreeTByte
++            && defaults.Map(255, default) == BluRayRunLengthMapping.SixTByte, "default mapping stays dark=AA light=44");
++        Require(inverted.Map(0, default) == BluRayRunLengthMapping.SixTByte
++            && inverted.Map(255, default) == BluRayRunLengthMapping.ThreeTByte, "inverted mapping stays dark=44 light=AA");
++        foreach (uint first in new[] { 0U, disc.TotalSectors / 2 / 32 * 32 })
++        {
++            BluRayStreamingOptions options = new(disc, first, 32);
++            using MemoryStream expected = new(), actual = new();
++            BluRayStreamingGenerator.GenerateToStream(expected, options,
++                new BluRayImagePayloadMapping(disc, raster, new ScalarPair(0x9E, 0x22)));
++            BluRayStreamingGenerator.GenerateToStream(actual, options, new BluRayImagePayloadMapping(disc, raster, pair));
++            Require(expected.ToArray().SequenceEqual(actual.ToArray()), $"explicit byte pair equals scalar oracle at sector {first}");
++        }
++    }
++
+     private static void TestIndependentScramble()
+     {
+         BluRayDiscParameters disc = new();
+@@ -205,6 +232,11 @@ internal static class BluRayParallelGenerationTests
+         public byte Map(byte luminance, BluRayPayloadBytePosition position) => _mapping.Map(luminance, position);
+     }
+ 
++    private sealed class ScalarPair(byte dark, byte light) : IBluRayLuminanceMapping
++    {
++        public byte Map(byte luminance, BluRayPayloadBytePosition position) => luminance < 128 ? dark : light;
++    }
++
+     private sealed class TrackingLuminance(int caller) : IBluRayLuminanceMapping
+     {
+         public int Count { get; private set; }
+-- 
+2.43.0
+
