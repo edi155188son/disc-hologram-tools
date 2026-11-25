@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>HoloCgh</AssemblyName>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <!-- compile the lenticular comparison only when the DIS tree carries the (reference) stereo-layer patch -->
+    <DefineConstants Condition="Exists('$(DisRoot)src/DvdImageSolver/Solver/StereoOverlay.cs')">$(DefineConstants);HAS_STEREO</DefineConstants>
+    <!-- the phase-probe sub-project has its own top-level program -->
+    <DefaultItemExcludes>$(DefaultItemExcludes);PhaseProbe/**</DefaultItemExcludes>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- the EFMPlus encoder and tables are internal to DvdImageSolver: compile the (GPL) sources into this tool instead of patching DIS -->
+    <Compile Include="$(DisRoot)src/DvdImageSolver/Encoding/EfmPlus*.cs;$(DisRoot)src/DvdImageSolver/Encoding/NrziCodewordMetrics.cs" LinkBase="DisEncoding" />
+    <ProjectReference Include="$(DisRoot)src/DvdImageSolver/DvdImageSolver.csproj" />
+    <ProjectReference Include="$(DisRoot)src/DiscImageStudio.Core/DiscImageStudio.Core.csproj" />
+    <ProjectReference Include="$(DisRoot)src/DiscImageStudio.ImageIO/DiscImageStudio.ImageIO.csproj" />
+  </ItemGroup>
+</Project>
