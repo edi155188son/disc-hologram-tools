@@ -2,7 +2,7 @@
 
 Base: upstream `main` at `6f0d8fd832f95c87ade6bdcb1e38c5955a7f629f` (2026-11-23, "Merge PR #393 ...").
 Apply to a *checkout of DIS*, never to this repository: `scripts/prepare-dis.sh` does it on a local branch.
-Authors are a placeholder (`Hologram Tools <noreply@example.invalid>`); use `git commit --amend --reset-author`
+Patch author: 天翔夏色 <148672659+edi155188son@users.noreply.github.com>; if you re-commit, use `git commit --amend --reset-author`
 (or `git rebase --exec`) before you send anything upstream.
 
 ## Upstream-able series (apply in order)

@@ -13,7 +13,7 @@ for a in "$@"; do case "$a" in --optional) opt=1;; --stereo) stereo=1;; *) echo 
 if [ ! -d "$dest/.git" ]; then git clone "$url" "$dest"; fi
 cd "$dest"
 git checkout -q -B holo-tools "$commit"
-id=(-c user.name="holo-tools" -c user.email="noreply@example.invalid")
+id=(-c user.name="dis-patch-apply" -c user.email="noreply@users.noreply.github.com")
 apply() { git "${id[@]}" am --3way --quiet "$@"; }
 apply "$here"/dis-patches/0*.patch
 [ "$opt" = 1 ] && apply "$here"/dis-patches/optional/*.patch

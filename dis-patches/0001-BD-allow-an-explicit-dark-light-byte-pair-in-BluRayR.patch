@@ -1,5 +1,5 @@
 From 13647d0bf5101f8bbfe2f81be555b7e9a0d90b7d Mon Sep 17 00:00:00 2001
-From: Hologram Tools <noreply@example.invalid>
+From: =?utf-8?b?5aSp57+U5aSP6Imy?= <148672659+edi155188son@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 01:48:45 +0800
 Subject: [PATCH 1/2] BD: allow an explicit dark/light byte pair in
  BluRayRunLengthMapping

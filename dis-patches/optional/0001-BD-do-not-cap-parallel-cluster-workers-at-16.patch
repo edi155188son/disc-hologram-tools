@@ -1,5 +1,5 @@
 From 69277e4416ee4f377be71be7f3505e6b96e05976 Mon Sep 17 00:00:00 2001
-From: Hologram Tools <noreply@example.invalid>
+From: =?utf-8?b?5aSp57+U5aSP6Imy?= <148672659+edi155188son@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 01:50:26 +0800
 Subject: [PATCH] BD: do not cap parallel cluster workers at 16
 

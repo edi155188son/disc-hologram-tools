@@ -1,5 +1,5 @@
 From c0903a3240bc00b8cf770ee22445f390c8d299f7 Mon Sep 17 00:00:00 2001
-From: Hologram Tools <noreply@example.invalid>
+From: =?utf-8?b?5aSp57+U5aSP6Imy?= <148672659+edi155188son@users.noreply.github.com>
 Date: Thu, 26 Nov 2026 01:49:11 +0800
 Subject: [PATCH 2/2] BD: optional per-cluster post-processing hook in
  BluRayStreamingOptions
