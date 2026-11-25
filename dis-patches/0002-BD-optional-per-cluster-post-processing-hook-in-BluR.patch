@@ -1,4 +1,4 @@
-From 1c318d46dca830f6c60d5de2f78ac042fb96b9d4 Mon Sep 17 00:00:00 2001
+From c0903a3240bc00b8cf770ee22445f390c8d299f7 Mon Sep 17 00:00:00 2001
 From: Hologram Tools <noreply@example.invalid>
 Date: Thu, 26 Nov 2026 01:49:11 +0800
 Subject: [PATCH 2/2] BD: optional per-cluster post-processing hook in
@@ -19,6 +19,9 @@ cancellation points are unchanged.
 Test: BluRayParallelGenerationTests flips all bytes in the hook and checks the
 output on the sequential and the parallel path, and that the hook runs exactly
 once per cluster with the right first sector / PSN.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01GxNFJbvyGe7p24QLA9QhqA
 ---
  .../BluRayStreamingGenerator.cs               | 31 ++++++++++++----
  .../BluRayParallelGenerationTests.cs          | 37 +++++++++++++++++++
